@@ -260,22 +260,12 @@ class KcpListener(object):
     def __init__(self, endpoint: aioudp.Endpoint) -> None:
         self._lcok = threading.Lock()
         self._poller = KcpPoller()
-        self._receiver = queue.Queue(10)
+        self._receiver = asyncio.Queue()
         self._endpoint = endpoint
         self._streams = {}
-        self._receiver_lock = threading.Lock()
-        self._receiver_waker = None
 
     async def accept(self) -> KcpStream:
-        if self._receiver.empty():
-            try:
-                self._receiver_lock.acquire()
-                self._receiver_waker = asyncio.Future()
-            finally:
-                self._receiver_lock.release()
-            await self._receiver_waker
-            self._receiver_waker = None
-        return self._receiver.get(block=False)
+        return await self._receiver.get()
 
     async def __poll_stream_recv(self):
         while True:
@@ -302,13 +292,7 @@ class KcpListener(object):
 
                     self._poller.register(kcp_core)
 
-                    try:
-                        self._receiver_lock.acquire()
-                        self._receiver.put(KcpStream(kcp_core), block=True)
-                        if self._receiver_waker:
-                            self._receiver_waker.set_result(None)
-                    finally:
-                        self._receiver_lock.release()
+                    await self._receiver.put(KcpStream(kcp_core))
 
                 streams[conv].input(data)
 
