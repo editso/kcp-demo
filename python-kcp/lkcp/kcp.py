@@ -1,0 +1,46 @@
+from . import core
+import sys
+
+__all__ = ["KcpObj"]
+
+class KcpObj:
+    def __init__(self, conv, id, callback):
+        self.cobj = core.lkcp_create(conv, id, callback)
+
+    def wndsize(self, sndwnd, rcvwnd):
+        core.lkcp_wndsize(self.cobj, sndwnd, rcvwnd)
+
+    def waitsnd(self):
+        return core.lkcp_waitsnd(self.cobj)
+
+    def nodelay(self, nodelay, interval, resend, nc):
+        return core.lkcp_nodelay(self.cobj, nodelay, interval, resend, nc)
+
+    def check(self, current):
+        return core.lkcp_check(self.cobj, current)
+
+    def update(self, current):
+        core.lkcp_update(self.cobj, current)
+
+    def send(self, data):
+        if sys.version_info.major == 3 and isinstance(data, str):
+            data = data.encode("UTF-8")
+        return core.lkcp_send(self.cobj, data)
+
+    def input(self, data):
+        return core.lkcp_input(self.cobj, data)
+
+    def recv(self):
+        return core.lkcp_recv(self.cobj)
+
+    def flush(self):
+        core.lkcp_flush(self.cobj)
+
+    def peeksize(self):
+        return core.lkcp_peeksize(self.cobj)
+
+    @staticmethod
+    def getconv(data):
+        # read conv
+        return (data[3] << 24 | data[2] << 16  | data[1] << 8 | data[0] << 0) & 0xFFFFFFFF
+    
