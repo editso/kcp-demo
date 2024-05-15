@@ -5,7 +5,7 @@ import logging
 
 
 async def main():
-    local = await aioudp.open_local_endpoint("127.0.0.1", port=8888)
+    local = await aioudp.open_local_endpoint("0.0.0.0", port=8989)
 
     async with impl.KcpListener(local) as listener:
         while True:

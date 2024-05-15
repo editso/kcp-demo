@@ -4,81 +4,128 @@ import asyncio
 import threading
 import logging
 import aioudp
-import queue
-
-from pykcp.pykcp import Kcp
-
 
 logging.basicConfig(level=logging.DEBUG)
+
+try:
+    import lkcp
+
+    class KcpCompat(lkcp.KcpObj):
+        def __init__(self, conv):
+            super().__init__(conv, 0, lambda a, b: self.output(b))
+
+        def output(self):
+            raise NotImplemented
+        
+        def recv(self):
+            return super().recv()[1]
+        
+except:
+    from pykcp.pykcp import Kcp
+
+    class KcpCompat(Kcp):
+        def __init__(self, conv):
+            super().__init__(conv)
 
 
 def now_time():
     return int(time.time() * 1000) & 0xFFFFFFFF
 
-
 def to_mills(v):
     return v / 1000
+
+def throw_if_non_none(ex, v, exc):
+    if ex:
+        logging.error(f"{ex.__name__}: {v}", exc_info=exc)
 
 
 class MutexLock(object):
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self.__lock_inner = threading.Lock()
 
     def lock(self):
-        self._lock.acquire()
+        self.__lock_inner.acquire()
 
     def unlock(self):
-        self._lock.release()
+        self.__lock_inner.release()
 
+class AsyncMutexLock(object):
+    def __init__(self) -> None:
+        self.__lock_inner = asyncio.Lock()
+
+    async def lock(self):
+        await self.__lock_inner.acquire()
+
+    async def unlock(self):
+        self.__lock_inner.release()
 
 class Locker:
 
-    def __init__(self, lock: MutexLock) -> None:
-        self._lock = lock
+    def __init__(self, lock: typing.Union[MutexLock, AsyncMutexLock]) -> None:
+        self.__mutex_lock = lock
 
     def __enter__(self) -> typing.Any:
-        self._lock.lock()
+        self.__mutex_lock.lock()
 
     def __exit__(self, *args):
-        self._lock.unlock()
+        self.__mutex_lock.unlock()
+        throw_if_non_none(*args)
+        
+    async def __aenter__(self):
+        await self.__mutex_lock.lock()
+
+    async def __aexit__(self, *args):
+        await self.__mutex_lock.unlock()
+        throw_if_non_none(*args)
 
 
-class Waker(MutexLock):
+class Atomic(MutexLock):
+
+    def __init__(self, val=None) -> None:
+        super().__init__()
+        self._val = val
+
+    def swap(self, new=None) -> typing.Optional[typing.Any]:
+        with Locker(self):
+            old = self._val
+            self._val = new
+            return old
+
+    def take(self) -> typing.Optional[typing.Any]:
+        return self.swap()
+
+class Waiter:
     def __init__(self) -> None:
-        self._future = None
+        self._waiter = Atomic()
         super().__init__()
 
     def set(self, future: asyncio.Future):
-        with Locker(self):
-            self._future = future
+        self._waiter.swap(future)
 
     def wake(self):
-        with Locker(self):
-            if self._future:
-                future = self._future
-                self._future = None
-                future.set_result(())
+        fut: typing.Optional[asyncio.Future] = self._waiter.take()
+        if fut and not fut.cancelled():
+            fut.set_result(None)
 
-
-class KcpCore(Kcp, MutexLock):
-
-    _read_waker: typing.Optional[asyncio.Future] = None
-    _write_waker: typing.Optional[asyncio.Future] = None
-    _check_waker: typing.Optional[Waker] = None
+class KcpCore(KcpCompat, MutexLock):
 
     def __init__(self, conv, callback):
+        MutexLock.__init__(self)
+        KcpCompat.__init__(self, conv)
+        
+        self.conv = conv
         self._last_check = now_time()
-        self._lock = threading.Lock()
         self._output_callback = callback
-        self._read_waker = None
-        self._check_waker = None
-        self._write_waker = None
-        self._write_waker_lock = threading.Lock()
-        self._read_waker_lock = threading.Lock()
-        super().__init__(conv)
-        self.wndsize(1024, 512)
-        self.nodelay(1, 20, 2, 1)
+        
+        self._read_waiter = Waiter()
+        self._write_waiter = Waiter()
+        self._check_waiter = Waiter()
+
+        self.snd_wnd = 1024
+             
+        self.wndsize(self.snd_wnd, 1024)
+        self.nodelay(1, 15, 1, 1)
 
     def update(self, current):
         return super().update(current)
@@ -90,38 +137,32 @@ class KcpCore(Kcp, MutexLock):
         return next_check - last_check
 
     def input(self, data):
-        super().input(data)
+        retval = super().input(data)
         if self.readable():
-            self._read_waker_lock.acquire()
-            try:
-                if self._read_waker:
-                    self._read_waker.set_result(None)
-                    self._read_waker = None
-            finally:
-                self._read_waker_lock.release()
-        self._check_waker.wake()
+            self._read_waiter.wake()
+        self._check_waiter.wake()
+        return retval
 
     def output(self, buf):
         retval = self._output_callback(buf)
         if self.writeable():
-            self._write_waker_lock.acquire()
-            try:
-                if self._write_waker:
-                    self._write_waker.set_result(None)
-            finally:
-                self._write_waker_lock.release()
+            self._read_waiter.wake()
+            self._write_waiter.wake()
         return retval
 
-    def recv(self, ispeek=False):
+    def recv(self):
         with Locker(self):
-            return super().recv(ispeek=False)
+            data = super().recv()
+            self._write_waiter.wake()
+            self._check_waiter.wake()
+            return data
 
     def send(self, buf):
         while Locker(self):
             retval = super().send(buf)
             self.update(now_time())
-            if self._check_waker:
-                self._check_waker.wake()
+            self.flush()
+            self._check_waiter.wake()
             return retval
 
     def readable(self) -> bool:
@@ -129,73 +170,66 @@ class KcpCore(Kcp, MutexLock):
             return self.peeksize() > 0
 
     def writeable(self) -> bool:
-        return True
+        with Locker(self):
+            return self.waitsnd() < self.snd_wnd * 2
     
     def updateable(self, now) -> bool:
-        return now > self._last_check
+        with Locker(self):
+            return now > self._last_check
 
-    def set_read_future(self, future):
-        self._read_waker_lock.acquire()
-        try:
-            self._read_waker = future
-        finally:
-            self._read_waker_lock.release()
+    def set_read_waiter(self, waiter):
+        self._read_waiter.set(waiter)
 
-    def set_write_future(self, future):
-        self._read_waker_lock.acquire()
-        try:
-            self._write_waker = future
-        finally:
-            self._write_waker_lock.release()
+    def set_write_waiter(self, waiter):
+        self._write_waiter.set(waiter)
 
-    def set_check_waker(self, waker):
-        self._check_waker = waker
+    def set_check_waiter(self, waiter):
+        self._check_waiter = waiter
 
 
-class KcpStream(MutexLock):
+class KcpStream(AsyncMutexLock):
 
     def __init__(self, core: KcpCore) -> None:
+        super().__init__()
         self._core = core
         self._read_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
-        super().__init__()
-
+    
     async def read(self) -> bytes:
-        future = None
-
-        if not self._core.readable():
+        while not self._core.readable():
+            waiter = asyncio.Future()
+            
             await self._read_lock.acquire()
+
+            self._core.set_read_waiter(waiter)
+
             try:
-                future = asyncio.Future()
-                self._core.set_read_future(future)
+                await waiter
             finally:
                 self._read_lock.release()
-
-        if future:
-            await future
-
-        with Locker(self):
+                            
+        async with Locker(self):
             return await self._do_read_internal()
 
     async def write(self, buf) -> int:
-        future = None
 
-        if not self._core.writeable():
+        while not self._core.writeable():
+            waiter = asyncio.Future()
+
             await self._write_lock.acquire()
-            try:
-                future = asyncio.Future()
-                self._core.set_write_future(future)
+
+            self._core.set_write_waiter(waiter)
+            
+            try:   
+                await waiter
             finally:
                 self._write_lock.release()
-
-        if future:
-            await future
-
-        with Locker(self):
+                
+        async with Locker(self):
             return await self._do_write_internal(buf)
-
+        
     async def _do_read_internal(self) -> bytes:
-        return self._core.recv(ispeek=False)
+        return self._core.recv()
 
     async def _do_write_internal(self, buf: bytes) -> int:
         return self._core.send(buf)
@@ -217,20 +251,19 @@ class Conv(object):
 
 
 class KcpPoller(object):
-    _kcps: typing.List[KcpCore]
+    _kcp_sessions: typing.List[KcpCore]
 
     def __init__(self) -> None:
-        self._kcps = []
+        self._kcp_sessions = []
         self._check_lock = threading.Lock()
-        self._running = None
-        self._check_waker = Waker()
+        self._check_waiter = Waiter()
 
     def register(self, kcp: KcpCore):
         self._check_lock.acquire()
         try:
-            kcp.set_check_waker(self._check_waker)
-            self._kcps.append(kcp)
-            self._check_waker.wake()
+            kcp.set_check_waiter(self._check_waiter)
+            self._kcp_sessions.append(kcp)
+            self._check_waiter.wake()
         finally:
             self._check_lock.release()
 
@@ -239,7 +272,7 @@ class KcpPoller(object):
         next_check = None
         try:
             min_check = None
-            for kcp in self._kcps:
+            for kcp in self._kcp_sessions:
                 next_check = kcp.check(now_time())
                 if min_check:
                     if min_check > next_check:
@@ -256,94 +289,99 @@ class KcpPoller(object):
             logging.debug("kcp check poller started")
 
             while True:
-                future = None
+                waiter = None
                 next_check = self._calc_next_check()
 
                 futures = []
 
-                future = asyncio.Future()
+                waiter = asyncio.Future()
 
-                self._check_waker.set(future)
+                self._check_waiter.set(waiter)
 
-                if self._kcps:
+                if self._kcp_sessions:
                     now = to_mills(next_check)
-                    # logging.debug("next time {}ms".format(now))
                     futures.append(asyncio.shield(asyncio.sleep(now)))
 
-                futures.append(future)
-
+                futures.append(waiter)
+                                
                 await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
-
+                
                 for fut in futures:
                     if not fut.done():
                         fut.cancel()
 
                 now = now_time()
-                for kcp in self._kcps:
-                    if not kcp.updateable(now):
-                        continue
-                    kcp.update(now)
 
-        self._running = asyncio.create_task(__start_check_poll())
+                for kcp in self._kcp_sessions:
+                    if kcp.updateable(now):
+                        kcp.update(now)
+
+        await __start_check_poll()
 
 
-class KcpConnector(object):
+class KcpConnector(AsyncMutexLock):
+    _tasks: typing.List[asyncio.Task]
     _streams: typing.Dict[int, KcpCore]
 
     def __init__(self, endpoint: aioudp.Endpoint) -> None:
-        self._lcok = asyncio.Lock()
-        self._streams = {}
-        self._poller = KcpPoller()
+        AsyncMutexLock.__init__(self)
+        
         self._conv = Conv()
+        self._tasks = []
+        self._poller = KcpPoller()
+        self._streams = {}
         self._endpoint = endpoint
 
     def __output_callback(self, data):
         self._endpoint.send(data)
 
     async def open(self) -> KcpStream:
-        await self._lcok.acquire()
-        try:
+       async with Locker(self):
             kcp_core = KcpCore(
-                self._conv.next(lambda v: v not in self._streams),
-                self.__output_callback,
+                    self._conv.next(lambda v: v not in self._streams),
+                    self.__output_callback,
             )
             self._poller.register(kcp_core)
             self._streams[kcp_core.conv] = kcp_core
             return KcpStream(kcp_core)
-        finally:
-            self._lcok.release()
 
     async def __poll_stream_recv(self):
-
-        while True:
-            data = await self._endpoint.receive()
-            conv = Kcp.getconv(data)
-            try:
-                await self._lcok.acquire()
-                if conv not in self._streams:
-                    logging.debug("invalid packet {}".format(data))
-                    continue
-                self._streams[conv].input(data)
-            finally:
-                self._lcok.release()
+        try:
+            while True:
+                data = await self._endpoint.receive()
+                conv = KcpCompat.getconv(data)
+                async with Locker(self):
+                    if conv not in self._streams:
+                        logging.debug("invalid packet {}".format(data))
+                        continue
+                    self._streams[conv].input(data)
+        except Exception as e:
+            logging.error("__poll_stream_recv", exc_info=e)
 
     async def __aenter__(self) -> "KcpConnector":
 
-        await self._poller.run()
+        fut = asyncio.wait([ asyncio.shield(self._poller.run()), asyncio.shield(self.__poll_stream_recv()) ])
 
-        asyncio.create_task(self.__poll_stream_recv())
-
+        self._tasks.append(asyncio.create_task(fut))
+        
         return self
 
     async def __aexit__(self, *args):
-        print(args)
+        for tsk in self._tasks:
+            if not tsk.done():
+               tsk.cancel()
+               
+        throw_if_non_none(*args)
 
 
-class KcpListener(object):
+class KcpListener(AsyncMutexLock):
+    _tasks: typing.List[asyncio.Task]
     _streams: typing.Dict[str, typing.Dict[int, KcpCore]]
 
     def __init__(self, endpoint: aioudp.Endpoint) -> None:
-        self._lcok = asyncio.Lock()
+        AsyncMutexLock.__init__(self)
+        
+        self._tasks = []
         self._poller = KcpPoller()
         self._receiver = asyncio.Queue()
         self._endpoint = endpoint
@@ -353,45 +391,47 @@ class KcpListener(object):
         return await self._receiver.get()
 
     async def __poll_stream_recv(self):
-        while True:
-            (data, address) = await self._endpoint.receive()
+        try:
+            while True:
+                (data, address) = await self._endpoint.receive()
+ 
+                kid = hash(address)
+                conv = KcpCompat.getconv(data)
+                
+                async with Locker(self):
+                    if kid not in self._streams:
+                        self._streams[kid] = {}
+                
+                    streams = self._streams[kid]
 
-            kid = hash(address)
-            conv = Kcp.getconv(data)
+                    if conv not in streams:
 
-            await self._lcok.acquire()
+                        def do_send(data):
+                            self._endpoint.send(data, address)
 
-            try:
+                        kcp_core = KcpCore(conv, do_send)
+                        streams[conv] = kcp_core
 
-                if kid not in self._streams:
-                    self._streams[kid] = {}
+                        self._poller.register(kcp_core)
 
-                streams = self._streams[kid]
+                        await self._receiver.put(KcpStream(kcp_core))
 
-                if conv not in streams:
-
-                    def do_send(data):
-                        self._endpoint.send(data, address)
-
-                    kcp_core = KcpCore(conv, do_send)
-                    streams[conv] = kcp_core
-
-                    self._poller.register(kcp_core)
-
-                    await self._receiver.put(KcpStream(kcp_core))
-
-                streams[conv].input(data)
-
-            finally:
-                self._lcok.release()
-
+                    streams[conv].input(data)
+        except Exception as e:
+            logging.error("__poll_stream_recv", exc_info=e)
+                
     async def __aenter__(self) -> "KcpListener":
 
-        await self._poller.run()
-
-        asyncio.create_task(self.__poll_stream_recv())
-
+        fut = asyncio.wait([ asyncio.shield(self._poller.run()), asyncio.shield(self.__poll_stream_recv()) ])
+            
+        self._tasks.append(asyncio.create_task(fut))
+ 
         return self
 
     async def __aexit__(self, *args):
-        print(args)
+    
+        for tsk in self._tasks:
+            if not tsk.done():
+               tsk.cancel()
+
+        throw_if_non_none(*args)
